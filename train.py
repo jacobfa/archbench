@@ -1,9 +1,12 @@
 """
 Usage:
-  ./run.sh <run_name> configs/65m/fftnet.yaml [configs/optim_soap.yaml] [key=value ...]
+  ./run.sh <run_name> configs/65m/pgdn.yaml [configs/optim_soap.yaml] [key=value ...]
   deepspeed --num_gpus 8 train.py configs/130m/gdn.yaml wandb.name=gdn-130m train.steps=2000
-  python train.py configs/65m/fftnet.yaml train.resume=<run_name>
-Sizes: configs/{40m,65m,130m,380m}/<arch>.yaml; check with scripts/count_params.py.
+  python train.py configs/65m/pgdn.yaml train.resume=<run_name>
+Sizes: configs/{40m,65m,130m,380m,650m,1b}/<arch>.yaml; check with scripts/count_params.py.
+Every model of a size trains on the same token budget (train.tokens in configs/<size>/_size.yaml);
+steps = train.tokens / tokens_per_step. Without train.tokens, steps = tokens_per_param * params / tokens_per_step.
+Set train.steps to override either.
 Logs go to train.log_dir/<run_name>, checkpoints to train.ckpt_dir/<run_name>.
 """
 

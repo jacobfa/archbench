@@ -1,7 +1,0 @@
-_base_: [../base.yaml, ../arch/fftnet_delta.yaml]
-
-model:
-  d_model: 768
-  n_layer: 10
-  layer:
-    num_heads: 12

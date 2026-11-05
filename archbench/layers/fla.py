@@ -1,5 +1,7 @@
 import inspect
 import math
+import sys
+import types
 
 import torch.nn as nn
 
@@ -17,6 +19,9 @@ class FLAMixer(nn.Module):
 
 
 def build_fla(cls_name: str, d_model: int, layer_idx: int, n_layer: int, **kwargs) -> FLAMixer:
+    # fla's Mamba2 fast path needs mamba_ssm's Triton kernels; importing mamba_ssm also pulls in its optional
+    # CUDA extension, which we don't build. A stub module keeps the import working (the extension is never called).
+    sys.modules.setdefault("selective_scan_cuda", types.ModuleType("selective_scan_cuda"))
     try:
         import fla.layers as L
     except ImportError as e:
@@ -42,7 +47,7 @@ def build_mesanet(d_model, layer_idx, n_layer, **kwargs):
 def build_mamba(d_model, layer_idx, n_layer, **kwargs):
     expand = kwargs.pop("expand", 2)
     kwargs.setdefault("intermediate_size", int(expand * d_model))
-    kwargs.setdefault("time_step_rank", math.ceil(d_model / 16))
+    kwargs.setdefault("dt_rank", math.ceil(d_model / 16))
     kwargs.setdefault("use_bias", False)
     return build_fla("Mamba", d_model, layer_idx, n_layer, **kwargs)
 

@@ -1,4 +1,4 @@
-_base_: [../base.yaml, ../arch/mamba2.yaml]
+_base_: [_size.yaml, ../arch/mamba2.yaml]
 
 model:
   d_model: 1024

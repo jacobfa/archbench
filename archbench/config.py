@@ -7,7 +7,7 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    arch: str = "fftnet"
+    arch: str = "pgdn"
     d_model: int = 512
     n_layer: int = 8
     vocab_size: Optional[int] = None
@@ -20,20 +20,20 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    path: str = "data/fineweb_edu"
+    path: str = "/dev/shm/fftnet/data/fineweb_edu"
     seq_len: int = 1024
 
 
 @dataclass
 class OptimConfig:
     name: str = "muon_adamw"
-    lr: float = 3e-4
+    lr: float = 6e-4
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    warmup_steps: int = 500
+    warmup_steps: int = 250
     grad_clip: float = 1.0
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
@@ -52,16 +52,18 @@ class DeepSpeedConfig:
 
 @dataclass
 class TrainConfig:
-    steps: int = 5000
-    batch_size: int = 32
-    grad_accum: int = 1
+    steps: Optional[int] = None  # None -> tokens / tokens_per_step, else tokens_per_param * params / tokens_per_step
+    tokens: Optional[float] = None  # fixed token budget shared by every model of a size (configs/<size>/_size.yaml)
+    tokens_per_param: float = 20.0
+    batch_size: int = 256
+    grad_accum: int = 2
     eval_every: int = 250
     eval_steps: int = 32
     log_every: int = 10
     ckpt_every: int = 1000
     log_dir: str = "logs"
-    ckpt_dir: str = "~/checkpoints/archbench"
-    compile: bool = False
+    ckpt_dir: str = "/dev/shm/fftnet/checkpoints"
+    compile: bool = True
     dtype: str = "bfloat16"
     seed: int = 0
     resume: Optional[str] = None
@@ -88,6 +90,13 @@ class Config:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def resolve_steps(train: TrainConfig, tokens_per_step: int, n_params: int) -> int:
+    if train.steps is not None:
+        return train.steps
+    tokens = train.tokens if train.tokens is not None else train.tokens_per_param * n_params
+    return max(1, round(tokens / tokens_per_step))
 
 
 def _merge(base: dict, over: dict) -> dict:

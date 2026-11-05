@@ -9,7 +9,7 @@ import torch.distributed as dist
 import yaml
 from torch.optim.lr_scheduler import LambdaLR
 
-from .config import Config
+from .config import Config, resolve_steps
 from .data import TokenData
 from .logger import Logger, Meter, PhaseTimer, fmt_count, fmt_duration
 from .model import LM
@@ -33,6 +33,9 @@ def build_ds_config(cfg: Config, micro_bs: int) -> dict:
         "steps_per_print": 10**9,
         "wall_clock_breakdown": False,
     }
+    if cfg.train.dtype != "float32":
+        # DeepSpeed disables an outer torch.autocast inside engine.forward unless this section is present.
+        conf["torch_autocast"] = {"enabled": True, "dtype": cfg.train.dtype, "lower_precision_safe_modules": []}
     conf.update(d.extra)
     return conf
 
@@ -74,11 +77,14 @@ class Trainer:
 
         model = LM(cfg.model).to(self.device)
         self.n_params = model.num_params()
+        self.param_groups = model.param_breakdown()
+        self.layer_params = model.layer_params()
+        t.steps = resolve_steps(t, self.tokens_per_step, self.n_params)
         opt = build_optimizer(model, cfg)
         sched = LambdaLR(opt, lambda s: lr_mult(s, cfg))
         self.engine, _, _, _ = deepspeed.initialize(model=model, optimizer=opt, lr_scheduler=sched, config=build_ds_config(cfg, self.micro_bs))
         if t.compile:
-            self.engine.compile()
+            self.engine.module.forward = torch.compile(self.engine.module.forward)
 
         self.run_name = t.resume or cfg.wandb.name or f"{cfg.model.arch}-{cfg.optim.name}-{time.strftime('%m%d-%H%M%S')}"
         self.log_dir = os.path.join(os.path.expanduser(t.log_dir), self.run_name)
@@ -97,24 +103,42 @@ class Trainer:
         self.meter = Meter(t.steps, t.eval_every, t.ckpt_every)
         self.log.summary(
             params=self.n_params,
+            params_non_embedding=self.n_params - self.param_groups["embed"],
+            **{f"params_{k}": v for k, v in self.param_groups.items()},
             tokens_per_step=self.tokens_per_step,
             total_tokens=self.tokens_per_step * t.steps,
+            tokens_per_param=self.tokens_per_step * t.steps / self.n_params,
+            total_steps=t.steps,
             world_size=self.world,
             device=torch.cuda.get_device_name(self.device) if self.cuda else "cpu",
             startup_s=time.perf_counter() - t_start,
         )
+
+    def _param_lines(self) -> str:
+        c, g, n = self.cfg.model, self.param_groups, self.n_params
+        lines = [f"params   {n:,} total ({fmt_count(n)}), {n - g['embed']:,} non-embedding ({fmt_count(n - g['embed'])})"]
+        for name, count in g.items():
+            if not count:
+                continue
+            note = "tied with lm_head" if name == "embed" and c.tie_embeddings else f"{c.n_layer} x {fmt_count(count / c.n_layer)}" if name in ("mixer", "mlp") else ""
+            lines.append(f"         {name:8s} {fmt_count(count):>8s} {100 * count / n:5.1f}%  {note}")
+        for part, params in self.layer_params.items():
+            lines.append(f"         block.{part}: " + ", ".join(f"{k} {list(s)} {fmt_count(v)}" for k, (s, v) in params.items()))
+        return "\n".join(lines)
 
     def banner(self):
         c = self.cfg
         self.log.print(
             f"run      {self.run_name}  logs={self.log_dir} ckpts={self.ckpt_dir}\n"
             f"arch     {c.model.arch}  d_model={c.model.d_model} n_layer={c.model.n_layer} mlp={c.model.mlp} layer={c.model.layer}\n"
-            f"params   {fmt_count(self.n_params)}\n"
+            f"{self._param_lines()}\n"
             f"optim    {c.optim.name}  lr={c.optim.lr:g} wd={c.optim.weight_decay:g} warmup={c.optim.warmup_steps} clip={c.optim.grad_clip:g}"
             + (f" muon_lr={c.optim.muon_lr:g}" if c.optim.name == "muon_adamw" else "") + "\n"
             f"data     {c.data.path}  train={fmt_count(self.data.num_tokens('train'))} val={fmt_count(self.data.num_tokens('val'))} seq_len={c.data.seq_len}\n"
             f"batch    {c.train.batch_size} x {c.data.seq_len} = {fmt_count(self.tokens_per_step)} tok/step, "
-            f"{fmt_count(self.tokens_per_step * c.train.steps)} total over {c.train.steps} steps (accum={c.train.grad_accum})\n"
+            f"{fmt_count(self.tokens_per_step * c.train.steps)} total over {c.train.steps} steps "
+            f"({self.tokens_per_step * c.train.steps / self.n_params:.1f} tok/param, "
+            f"budget={'fixed train.tokens' if c.train.tokens is not None else f'{c.train.tokens_per_param:g} tok/param'}, accum={c.train.grad_accum})\n"
             f"system   {self.device} x{self.world}  dtype={c.train.dtype} zero={c.deepspeed.zero_stage} compile={c.train.compile}"
         )
 

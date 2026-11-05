@@ -1,4 +1,4 @@
-_base_: [../base.yaml, ../arch/gdn.yaml]
+_base_: [_size.yaml, ../arch/gdn.yaml]
 
 model:
   d_model: 384

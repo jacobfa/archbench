@@ -1,0 +1,4 @@
+_base_: ../base.yaml
+
+train:
+  tokens: 7.6e+9  # 20 tokens per nominal parameter, shared by every 380m model

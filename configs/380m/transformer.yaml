@@ -1,4 +1,4 @@
-_base_: [../base.yaml, ../arch/transformer.yaml]
+_base_: [_size.yaml, ../arch/transformer.yaml]
 
 model:
   d_model: 1024

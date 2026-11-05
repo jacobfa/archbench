@@ -6,17 +6,17 @@ model:
   tie_embeddings: true
 
 data:
-  path: data/fineweb_edu
+  path: /dev/shm/fftnet/data/fineweb_edu
   seq_len: 1024
 
 optim:
   name: muon_adamw
-  lr: 3.0e-4
+  lr: 6.0e-4
   min_lr_ratio: 0.1
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
-  warmup_steps: 500
+  warmup_steps: 250
   grad_clip: 1.0
   muon_lr: 0.02
   muon_momentum: 0.95
@@ -26,16 +26,17 @@ deepspeed:
   zero_stage: 0
 
 train:
-  steps: 5000
-  batch_size: 32
-  grad_accum: 1
+  steps: null
+  tokens_per_param: 20
+  batch_size: 256
+  grad_accum: 2
   eval_every: 250
   eval_steps: 32
   log_every: 10
   ckpt_every: 1000
   log_dir: logs
-  ckpt_dir: ~/checkpoints/archbench
-  compile: false
+  ckpt_dir: /dev/shm/fftnet/checkpoints
+  compile: true
   dtype: bfloat16
   peak_tflops: null
 

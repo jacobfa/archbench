@@ -1,4 +1,4 @@
-_base_: [../base.yaml, ../arch/mesanet.yaml]
+_base_: [_size.yaml, ../arch/mesanet.yaml]
 
 model:
   d_model: 768

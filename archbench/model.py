@@ -61,6 +61,23 @@ class LM(nn.Module):
         n = sum(p.numel() for p in self.parameters())
         return n - self.embed.weight.numel() if non_embedding else n
 
+    def param_breakdown(self) -> dict[str, int]:
+        groups = {"embed": self.embed.weight.numel(), "mixer": 0, "mlp": 0, "norm": 0, "lm_head": 0}
+        for name, p in self.named_parameters():
+            part = name.split(".")
+            if part[0] == "blocks":
+                groups[part[2] if part[2] in ("mixer", "mlp") else "norm"] += p.numel()
+            elif part[0] == "norm":
+                groups["norm"] += p.numel()
+            elif part[0] == "lm_head":
+                groups["lm_head"] += p.numel()
+        return groups
+
+    def layer_params(self) -> dict[str, dict[str, tuple[torch.Size, int]]]:
+        block = self.blocks[0]
+        parts = {"mixer": block.mixer, "mlp": block.mlp} if block.mlp is not None else {"mixer": block.mixer}
+        return {k: {n: (p.shape, p.numel()) for n, p in m.named_parameters()} for k, m in parts.items()}
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.embed(idx)
         for block in self.blocks:
