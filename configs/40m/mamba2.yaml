@@ -1,0 +1,7 @@
+_base_: [../base.yaml, ../arch/mamba2.yaml]
+
+model:
+  d_model: 384
+  n_layer: 24
+  layer:
+    num_heads: 12

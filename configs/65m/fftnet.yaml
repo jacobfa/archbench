@@ -1,0 +1,7 @@
+_base_: [../base.yaml, ../arch/fftnet.yaml]
+
+model:
+  d_model: 512
+  n_layer: 10
+  layer:
+    num_heads: 8

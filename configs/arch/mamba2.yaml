@@ -1,0 +1,11 @@
+model:
+  arch: mamba2
+  mlp: false
+  layer:
+    state_size: 64
+    head_dim: 64
+    expand: 2
+    conv_kernel: 4
+
+wandb:
+  tags: [mamba2]

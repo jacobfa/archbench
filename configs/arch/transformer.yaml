@@ -1,0 +1,11 @@
+model:
+  arch: attention
+  mlp: true
+  layer:
+    rope_base: 10000.0
+
+train:
+  compile: true
+
+wandb:
+  tags: [transformer]

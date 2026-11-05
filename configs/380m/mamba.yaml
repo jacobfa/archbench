@@ -1,0 +1,5 @@
+_base_: [../base.yaml, ../arch/mamba.yaml]
+
+model:
+  d_model: 1024
+  n_layer: 48

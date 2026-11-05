@@ -1,0 +1,8 @@
+optim:
+  name: adamw
+  lr: 6.0e-4
+  weight_decay: 0.1
+
+deepspeed:
+  zero_stage: 2
+  overlap_comm: true

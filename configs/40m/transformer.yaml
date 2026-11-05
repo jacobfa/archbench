@@ -1,0 +1,7 @@
+_base_: [../base.yaml, ../arch/transformer.yaml]
+
+model:
+  d_model: 384
+  n_layer: 13
+  layer:
+    num_heads: 6

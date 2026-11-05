@@ -1,0 +1,11 @@
+optim:
+  name: muon_adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  muon_lr: 0.02
+  muon_momentum: 0.95
+  muon_weight_decay: 0.0
+  muon_ns_steps: 5
+
+deepspeed:
+  zero_stage: 0

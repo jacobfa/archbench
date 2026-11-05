@@ -1,0 +1,7 @@
+_base_: [../base.yaml, ../arch/mesanet.yaml]
+
+model:
+  d_model: 384
+  n_layer: 12
+  layer:
+    num_heads: 3

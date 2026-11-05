@@ -1,0 +1,10 @@
+_base_: fftnet.yaml
+
+model:
+  layer:
+    mode: delta
+    channels: 4
+    checkpoint_scan: true
+
+wandb:
+  tags: [fftnet, delta]

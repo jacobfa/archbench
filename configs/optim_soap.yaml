@@ -1,0 +1,11 @@
+optim:
+  name: soap
+  lr: 3.0e-3
+  beta1: 0.95
+  beta2: 0.95
+  weight_decay: 0.01
+  soap_precondition_frequency: 10
+  soap_max_precond_dim: 8192
+
+deepspeed:
+  zero_stage: 0
