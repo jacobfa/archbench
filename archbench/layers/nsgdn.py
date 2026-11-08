@@ -18,6 +18,7 @@ from . import register
 
 try:
     from causal_conv1d import causal_conv1d_fn
+    from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function, causal_conv1d_fwd_function
 except ImportError:  # pragma: no cover
     causal_conv1d_fn = None
 
@@ -28,7 +29,12 @@ except ImportError:  # pragma: no cover
     triton = None
 
 try:
+    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+    from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
+    from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
     from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
+    from fla.ops.utils import chunk_local_cumsum, solve_tril
+    from fla.ops.utils.constant import RCP_LN2
 except ImportError:  # pragma: no cover
     chunk_dplr_delta_rule = None
 
@@ -41,12 +47,13 @@ def nsgdn_available(x: torch.Tensor) -> bool:
     return triton is not None and x.is_cuda
 
 
-def pick_scan(x: torch.Tensor):
-    if x.is_cuda and chunk_dplr_delta_rule is not None:
-        return nsgdn_scan_fla
-    if nsgdn_available(x):
-        return nsgdn_scan
-    return nsgdn_ref
+def pick_scan(x: torch.Tensor, impl: str = "chunk"):
+    """impl: 'chunk' (scalar-gate chunked kernel), 'dplr' (fla DPLR), 'triton' (fp32 token scan), 'ref'."""
+    if impl == "ref" or not x.is_cuda:
+        return nsgdn_ref
+    if impl == "triton" or chunk_dplr_delta_rule is None:
+        return nsgdn_scan if triton is not None else nsgdn_ref
+    return nsgdn_scan_dplr if impl == "dplr" else nsgdn_scan_chunk
 
 
 def write_direction(k, p, beta, lam, n_steps: int) -> torch.Tensor:
@@ -206,19 +213,188 @@ def nsgdn_scan(q, k, u, v, la) -> torch.Tensor:
     return _nsgdn_fwd(q.contiguous(), k.contiguous(), u.contiguous(), v.contiguous(), la.contiguous())[0]
 
 
-def nsgdn_scan_fla(q, k, u, v, la) -> torch.Tensor:
+def nsgdn_scan_dplr(q, k, u, v, la, la_min: float | None = None) -> torch.Tensor:
     """Same recurrence on fla's chunked DPLR kernel; y (B, T, H, DV) in bf16.
 
     With S' = S^T (DK x DV) the step is S' = (alpha I - alpha u k^T) S' + u v^T, y = S'^T q, i.e. fla's
     S' = (diag(exp gk) + b a^T) S' + k_fla v^T with k_fla = b = u, a = -alpha k, gk = la broadcast over DK, scale 1
-    (q is already scaled by DK^-1/2 in the module).
+    (q is already scaled by DK^-1/2 in the module).  If la >= la_min is guaranteed (la_min >= -2.6), fla can use
+    64-token chunks and the tensor-core A stage; otherwise it falls back to 16-token chunks.
     """
     dt = torch.bfloat16
     a = -(la.exp()[..., None] * k)
     gk = la[..., None].expand_as(k)
     u = u.to(dt)
-    y, _ = chunk_dplr_delta_rule(q.to(dt), u, v.to(dt), a.to(dt), u, gk, scale=1.0)
+    y, _ = chunk_dplr_delta_rule(q.to(dt), u, v.to(dt), a.to(dt), u, gk, scale=1.0, lower_bound=la_min)
     return y
+
+
+# --- chunked scan specialised to a scalar gate and separate read (k) / write (u) vectors -------------------------
+# fla's GatedDeltaNet pipeline is S' = alpha S' + k (v - alpha S'^T k)^T beta with ONE vector k.  Ours is
+# S' = alpha S' + u (v - alpha S'^T k)^T.  Within a 64-token chunk (gamma_t = prod alpha, T = (I + L)^-1):
+#     L_ij = (k_i . u_j) gamma_i / gamma_j   (i > j),   w = T (k * gamma),   u_wy = T v,
+#     r = u_wy - w S'_0,   S'_C = gamma_C S'_0 + sum_j (gamma_C / gamma_j) u_j r_j^T,
+#     y_t = gamma_t S'_0^T q_t + sum_{j <= t} (gamma_t / gamma_j) (u_j . q_t) r_j,
+# which is exactly fla's GDN pipeline with beta = 1 and the write vector u in place of k everywhere except the
+# WY prep.  So the WY prep (L, T, and its backward) is ours; inter-chunk state, output and their backward reuse
+# fla's tensor-core kernels.  fla's g is the chunk-local cumsum of la in log2 units, and dg is accumulated in
+# natural units (coefficient * gamma) and reverse-cumsummed, as in fla.
+
+BT_CHUNK = 64
+
+if triton is not None:
+
+    @triton.jit
+    def _wy_L_kernel(k_ptr, u_ptr, g_ptr, L_ptr, T, H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr):
+        """L = tril(k u^T, -1) * exp2(g_i - g_j) for one (chunk, b, h); fp32 (B, T, H, BT)."""
+        i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        o_t = i_t * BT + tl.arange(0, BT)
+        o_j = tl.arange(0, BT)
+        row = (i_b * T + o_t) * H + i_h  # token row index into (B, T, H, *)
+        b_g = tl.load(g_ptr + row)
+        b_M = tl.zeros([BT, BT], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            o_k = i_k * BK + tl.arange(0, BK)
+            b_k = tl.load(k_ptr + row[:, None] * K + o_k[None, :])
+            b_u = tl.load(u_ptr + row[:, None] * K + o_k[None, :])
+            b_M = tl.dot(b_k, tl.trans(b_u), b_M)
+        m_A = o_j[:, None] > o_j[None, :]
+        b_E = tl.where(m_A, tl.exp2(b_g[:, None] - b_g[None, :]), 0.0)
+        tl.store(L_ptr + row[:, None] * BT + o_j[None, :], b_M * b_E)
+
+    @triton.jit
+    def _wy_bwd_kernel(
+        k_ptr, u_ptr, v_ptr, g_ptr, A_ptr, dw_ptr, du_ptr, dk_ptr, duo_ptr, dv_ptr, dg_ptr, T,
+        H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    ):
+        """Backward of w = A (k gamma), u_wy = A v with A = (I + L)^-1, L = tril(k u^T, -1) * E.  Mirrors fla's
+        prepare_wy_repr_bwd_kernel with the write vector u in place of the second k.  dg in natural units."""
+        i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        o_t = i_t * BT + tl.arange(0, BT)
+        o_j = tl.arange(0, BT)
+        row = (i_b * T + o_t) * H + i_h
+        b_g = tl.load(g_ptr + row)
+        b_ge = tl.exp2(b_g)
+        b_At = tl.load(A_ptr + row[None, :] * BT + o_j[:, None])  # A^T (bf16)
+        b_dA = tl.zeros([BT, BT], dtype=tl.float32)
+        b_dg = tl.zeros([BT], dtype=tl.float32)
+        # pass 1 over K: dA += dw (k gamma)^T, dk_partial = A^T dw gamma, dg += rowsum(A^T dw * k gamma)
+        for i_k in range(tl.cdiv(K, BK)):
+            o_k = i_k * BK + tl.arange(0, BK)
+            b_k = tl.load(k_ptr + row[:, None] * K + o_k[None, :])
+            b_dw = tl.load(dw_ptr + row[:, None] * K + o_k[None, :])
+            b_kg = b_k * b_ge[:, None]
+            b_dA = tl.dot(b_dw, tl.trans(b_kg).to(b_dw.dtype), b_dA)
+            b_dkg = tl.dot(b_At, b_dw)
+            b_dg += tl.sum(b_dkg * b_kg, 1)
+            tl.store(dk_ptr + row[:, None] * K + o_k[None, :], (b_dkg * b_ge[:, None]).to(dk_ptr.dtype.element_ty))
+        # pass over V: dA += du v^T, dv = A^T du
+        for i_v in range(tl.cdiv(V, BV)):
+            o_v = i_v * BV + tl.arange(0, BV)
+            b_v = tl.load(v_ptr + row[:, None] * V + o_v[None, :])
+            b_du = tl.load(du_ptr + row[:, None] * V + o_v[None, :])
+            b_dA = tl.dot(b_du, tl.trans(b_v), b_dA)
+            tl.store(dv_ptr + row[:, None] * V + o_v[None, :], tl.dot(b_At, b_du).to(dv_ptr.dtype.element_ty))
+        # dL = -(A^T dA A^T) masked;  dM = dL * E
+        m_A = o_j[:, None] > o_j[None, :]
+        b_dA = tl.where(m_A, b_dA, 0.0)
+        b_dA = tl.dot(b_dA.to(b_At.dtype), b_At)
+        b_dA = tl.dot(b_At, b_dA.to(b_At.dtype))
+        b_E = tl.where(m_A, tl.exp2(b_g[:, None] - b_g[None, :]), 0.0)
+        b_dM = tl.where(m_A, -b_dA * b_E, 0.0)
+        b_dMb = b_dM.to(b_At.dtype)
+        # pass 2 over K: dk += dM u, du = dM^T k, and recompute M = k u^T for dg
+        b_M = tl.zeros([BT, BT], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            o_k = i_k * BK + tl.arange(0, BK)
+            b_k = tl.load(k_ptr + row[:, None] * K + o_k[None, :])
+            b_u = tl.load(u_ptr + row[:, None] * K + o_k[None, :])
+            b_M = tl.dot(b_k, tl.trans(b_u), b_M)
+            b_dk = tl.dot(b_dMb, b_u) + tl.load(dk_ptr + row[:, None] * K + o_k[None, :])
+            tl.store(dk_ptr + row[:, None] * K + o_k[None, :], b_dk.to(dk_ptr.dtype.element_ty))
+            b_du = tl.dot(tl.trans(b_dMb), b_k)
+            tl.store(duo_ptr + row[:, None] * K + o_k[None, :], b_du.to(duo_ptr.dtype.element_ty))
+        # dg += rowsum(dL * L) - colsum(dL * L), with dL * L = dM * M
+        b_P = b_dM * b_M
+        b_dg += tl.sum(b_P, 1) - tl.sum(b_P, 0)
+        tl.store(dg_ptr + row, b_dg)
+
+
+def _wy_fwd(k, u, g, BT):
+    B, T, H, K = k.shape
+    L = torch.empty(B, T, H, BT, device=k.device, dtype=torch.float32)
+    _wy_L_kernel[(T // BT, B * H)](k, u, g, L, T, H=H, K=K, BT=BT, BK=min(K, 64), num_warps=4)
+    return solve_tril(L, output_dtype=k.dtype)  # (I + L)^-1 as (B, T, H, BT)
+
+
+def _wy_bwd(k, u, v, g, A, dw, du_wy, BT):
+    B, T, H, K = k.shape
+    V = v.shape[-1]
+    dk, du, dv, dg = torch.empty_like(k), torch.empty_like(u), torch.empty_like(v), torch.empty_like(g)
+    _wy_bwd_kernel[(T // BT, B * H)](
+        k, u, v, g, A, dw, du_wy, dk, du, dv, dg, T, H=H, K=K, V=V, BT=BT, BK=min(K, 64), BV=min(V, 64), num_warps=4
+    )
+    return dk, du, dv, dg
+
+
+if chunk_dplr_delta_rule is not None:
+
+    @torch.library.custom_op("archbench::nsgdn_chunk_fwd", mutates_args=())
+    def _nsgdn_chunk_fwd(
+        q: torch.Tensor, k: torch.Tensor, u: torch.Tensor, v: torch.Tensor, la: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        BT = BT_CHUNK
+        g = chunk_local_cumsum(la, chunk_size=BT, scale=RCP_LN2)
+        A = _wy_fwd(k, u, g, BT)
+        ones = torch.ones_like(la, dtype=k.dtype)
+        w, u_wy = recompute_w_u_fwd(k=k, v=v, beta=ones, A=A, g=g)
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(k=u, w=w, u=u_wy, g=g, chunk_size=BT)
+        y = chunk_fwd_o(q=q, k=u, v=v_new, h=h, g=g, scale=1.0, chunk_size=BT)
+        return y, g, A
+
+    @_nsgdn_chunk_fwd.register_fake
+    def _(q, k, u, v, la):
+        return torch.empty_like(v), torch.empty_like(la), k.new_empty(*k.shape[:3], BT_CHUNK)
+
+    @torch.library.custom_op("archbench::nsgdn_chunk_bwd", mutates_args=())
+    def _nsgdn_chunk_bwd(
+        q: torch.Tensor, k: torch.Tensor, u: torch.Tensor, v: torch.Tensor, g: torch.Tensor, A: torch.Tensor, dy: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        BT = BT_CHUNK
+        ones = torch.ones_like(g, dtype=k.dtype)
+        w, u_wy = recompute_w_u_fwd(k=k, v=v, beta=ones, A=A, g=g)
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(k=u, w=w, u=u_wy, g=g, chunk_size=BT)
+        dv_new = chunk_bwd_dv_local(q=q, k=u, g=g, do=dy, scale=1.0, chunk_size=BT)
+        dh, _, dv_new = chunk_gated_delta_rule_bwd_dhu(q=q, k=u, w=w, g=g, do=dy, dv=dv_new, scale=1.0, chunk_size=BT)
+        dq, du, dw, dg = chunk_bwd_dqkwg(q=q, k=u, v=v_new, w=w, g=g, h=h, dv=dv_new, do=dy, dh=dh, scale=1.0, chunk_size=BT)
+        dk, du2, dv, dg2 = _wy_bwd(k, u, v, g, A, dw, dv_new, BT)
+        dla = chunk_local_cumsum(dg + dg2, chunk_size=BT, reverse=True)
+        return dq, dk, du + du2, dv, dla
+
+    @_nsgdn_chunk_bwd.register_fake
+    def _(q, k, u, v, g, A, dy):
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(u), torch.empty_like(v), torch.empty_like(g)
+
+    def _chunk_setup(ctx, inputs, output):
+        q, k, u, v, la = inputs
+        _, g, A = output
+        ctx.save_for_backward(q, k, u, v, g, A)
+
+    def _chunk_backward(ctx, dy, dg, dA):
+        q, k, u, v, g, A = ctx.saved_tensors
+        return _nsgdn_chunk_bwd(q, k, u, v, g, A, dy.contiguous())
+
+    _nsgdn_chunk_fwd.register_autograd(_chunk_backward, setup_context=_chunk_setup)
+
+
+def nsgdn_scan_chunk(q, k, u, v, la) -> torch.Tensor:
+    """Chunked scalar-gate kernel (see above); bf16 inputs/outputs, fp32 state and gate."""
+    if q.shape[1] % BT_CHUNK:
+        return nsgdn_scan_dplr(q, k, u, v, la)
+    dt = torch.bfloat16
+    return _nsgdn_chunk_fwd(q.to(dt).contiguous(), k.to(dt).contiguous(), u.to(dt).contiguous(), v.to(dt).contiguous(), la.contiguous().float())[0]
 
 
 def nsgdn_ref(q, k, u, v, la) -> torch.Tensor:
@@ -233,6 +409,43 @@ def nsgdn_ref(q, k, u, v, la) -> torch.Tensor:
     return torch.stack(ys, 1)
 
 
+if causal_conv1d_fn is not None:
+    # causal_conv1d's own autograd.Function calls its C++ op with `out=`, which breaks torch.compile graphs; these
+    # custom ops wrap the same kernels as a single opaque op (x, y, dy are (B, D, T) channel-last views).
+
+    def _channel_last(x: torch.Tensor) -> torch.Tensor:
+        return x if x.stride(1) == 1 else x.transpose(1, 2).contiguous().transpose(1, 2)
+
+    @torch.library.custom_op("archbench::causal_conv_silu", mutates_args=())
+    def _causal_conv_silu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return causal_conv1d_fwd_function(_channel_last(x), weight, None, None, None, None, True)
+
+    @_causal_conv_silu.register_fake
+    def _(x, weight):
+        B, D, T = x.shape
+        return torch.empty(B, T, D, dtype=x.dtype, device=x.device).transpose(1, 2)
+
+    @torch.library.custom_op("archbench::causal_conv_silu_bwd", mutates_args=())
+    def _causal_conv_silu_bwd(x: torch.Tensor, weight: torch.Tensor, dy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = _channel_last(x)
+        dx, dw, _, _ = causal_conv1d_bwd_function(x, weight, None, _channel_last(dy), None, None, None, None, False, True)
+        return dx, dw
+
+    @_causal_conv_silu_bwd.register_fake
+    def _(x, weight, dy):
+        B, D, T = x.shape
+        return torch.empty(B, T, D, dtype=x.dtype, device=x.device).transpose(1, 2), torch.empty_like(weight)
+
+    def _conv_setup(ctx, inputs, output):
+        ctx.save_for_backward(*inputs)
+
+    def _conv_backward(ctx, dy):
+        x, weight = ctx.saved_tensors
+        return _causal_conv_silu_bwd(x, weight, dy)
+
+    _causal_conv_silu.register_autograd(_conv_backward, setup_context=_conv_setup)
+
+
 class ShortConv(nn.Module):
     def __init__(self, dim: int, size: int):
         super().__init__()
@@ -241,7 +454,9 @@ class ShortConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if causal_conv1d_fn is not None and x.is_cuda:
-            return causal_conv1d_fn(x.transpose(1, 2), self.weight.squeeze(1).to(x.dtype), activation="silu").transpose(1, 2)
+            # (B, T, D) -> channel-last (B, D, T) view, as causal_conv1d expects; the kernels keep that layout
+            y = _causal_conv_silu(x.transpose(1, 2), self.weight.squeeze(1).to(x.dtype))
+            return y.transpose(1, 2)
         T = x.shape[1]
         y = F.conv1d(x.transpose(1, 2), self.weight.to(x.dtype), padding=self.size - 1, groups=x.shape[2])
         return F.silu(y[..., :T].transpose(1, 2))
@@ -260,6 +475,8 @@ class NStepGDN(nn.Module):
         use_short_conv: bool = True,
         conv_size: int = 4,
         norm_eps: float = 1e-5,
+        scan_impl: str = "chunk",
+        la_min: float | None = None,
         layer_idx: int | None = None,
     ):
         super().__init__()
@@ -283,6 +500,10 @@ class NStepGDN(nn.Module):
         self.b_bias = nn.Parameter(torch.zeros(num_heads))
         self.lam = nn.Parameter(torch.full((num_heads,), math.log(math.expm1(lam))))
         self.norm = nn.RMSNorm(DV, eps=norm_eps)
+        if scan_impl not in ("chunk", "dplr", "triton", "ref"):
+            raise ValueError(f"unknown scan_impl {scan_impl!r}")
+        self.scan_impl = scan_impl
+        self.la_min = la_min  # optional floor on the log-retention (only needed for the dplr path's 64-token chunks)
         self.o_proj = nn.Linear(self.v_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -300,10 +521,13 @@ class NStepGDN(nn.Module):
             v = qkv[..., 2 * self.qk_dim :].view(B, T, H, DV)
             ab = ab.float()
             la = -F.softplus(ab[..., :H] + self.dt_bias) * self.A_log.exp()
+            if self.la_min is not None:
+                la = la.clamp_min(self.la_min)
             beta = torch.sigmoid(ab[..., H:] + self.b_bias)
             p = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))
             u = write_direction(k, p, beta, F.softplus(self.lam.float()), self.n_steps)
-            y = pick_scan(x)(q, k, u, v, la)
+            scan = pick_scan(x, self.scan_impl)
+            y = scan(q, k, u, v, la, la_min=self.la_min) if scan is nsgdn_scan_dplr else scan(q, k, u, v, la)
         y = self.norm(y.to(x.dtype))
         if self.use_gate:
             y = y * F.silu(g).view(B, T, H, DV)
