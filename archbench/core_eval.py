@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -94,8 +95,9 @@ def _example(fn, tok, data: list[dict], idx: int, task: dict, max_len: int | Non
     return means.index(min(means)) == item["gold"]
 
 
-def evaluate_core(fn, tok, device, bundle_dir: str, max_per_task: int = -1, max_len: int | None = None, verbose: bool = False):
-    """fn maps (B, T) token ids to (B, T, V) logits. Returns (core_metric, accuracy per task, centered accuracy per task)."""
+def evaluate_core(fn, tok, device, bundle_dir: str, max_per_task: int = -1, max_len: int | None = None, log=None):
+    """fn maps (B, T) token ids to (B, T, V) logits. Returns (core_metric, accuracy per task, centered accuracy per task).
+    If log is given, each task's result is passed to it as a string when it completes (rank 0 only)."""
     rank, world = (dist.get_rank(), dist.get_world_size()) if dist.is_initialized() else (0, 1)
     bundle_dir = os.path.expanduser(bundle_dir)
     if int(os.environ.get("LOCAL_RANK", 0)) == 0 and not os.path.exists(bundle_dir):
@@ -113,6 +115,7 @@ def evaluate_core(fn, tok, device, bundle_dir: str, max_per_task: int = -1, max_
         random.Random(1337).shuffle(data)
         if max_per_task > 0:
             data = data[:max_per_task]
+        t0 = time.perf_counter()
         correct = torch.zeros(len(data), device=device)
         for i in range(rank, len(data), world):
             correct[i] = float(_example(fn, tok, data, i, task, max_len, device))
@@ -121,8 +124,11 @@ def evaluate_core(fn, tok, device, bundle_dir: str, max_per_task: int = -1, max_
         label, b = task["label"], baselines[task["label"]]
         acc[label] = correct.mean().item()
         centered[label] = (acc[label] - b) / (1 - b)
-        if verbose and rank == 0:
-            print(f"{label:35s} acc {acc[label]:.4f}  centered {centered[label]:+.4f}", flush=True)
+        if log is not None and rank == 0:
+            log(
+                f"  core {label:28s} {task['num_fewshot'][0]}-shot {task['icl_task_type']:28s} "
+                f"acc {acc[label]:.4f} | centered {centered[label]:+.4f} | took {time.perf_counter() - t0:.1f}s"
+            )
     return sum(centered.values()) / len(centered), acc, centered
 
 
