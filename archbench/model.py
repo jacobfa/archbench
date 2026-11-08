@@ -9,10 +9,7 @@ from .layers import build_mixer
 from .layers.attention import Attention
 from .layers.fla import FLAMixer
 
-try:  # fused lm_head + cross-entropy: never materialises the (B*T, vocab) logits
-    from fla.modules import FusedLinearCrossEntropyLoss
-except ImportError:  # pragma: no cover
-    FusedLinearCrossEntropyLoss = None
+from .fused_ce import fused_ce_available, fused_linear_cross_entropy
 
 OUT_PROJ = ("o_proj", "out_proj", "down")
 SMEAR_DIM = 24
@@ -73,7 +70,6 @@ class LM(nn.Module):
             self.smear_lambda = nn.Parameter(torch.zeros(1))
         if cfg.backout:
             self.backout_lambda = nn.Parameter(torch.full((1,), 0.2))
-        self.fused_ce = FusedLinearCrossEntropyLoss() if FusedLinearCrossEntropyLoss is not None else None
         self._init_weights()
 
     def _init_weights(self):
@@ -141,10 +137,9 @@ class LM(nn.Module):
         if self.backout_lambda is not None:
             x = x - self.backout_lambda * x_mid
         x = self.norm(x)
-        if targets is not None and self.fused_ce is not None and x.is_cuda and not c.logit_softcap:
-            # training/eval only need the loss; the fused kernel chunks over tokens and skips the logits tensor
+        if targets is not None and fused_ce_available() and x.is_cuda and not c.logit_softcap:
             dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
-            return None, self.fused_ce(x.to(dt), targets, self.lm_head.weight.to(dt))
+            return None, fused_linear_cross_entropy(x.to(dt), targets, self.lm_head.weight.to(dt))
         logits = self.lm_head(x)
         if c.logit_softcap:
             logits = c.logit_softcap * torch.tanh(logits.float() / c.logit_softcap)
