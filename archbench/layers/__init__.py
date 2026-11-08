@@ -23,4 +23,4 @@ def build_mixer(name: str, d_model: int, layer_idx: int, n_layer: int, **kwargs)
     return _REGISTRY[name](d_model=d_model, layer_idx=layer_idx, n_layer=n_layer, **kwargs)
 
 
-from . import attention, fla, pgdn  # noqa: E402,F401
+from . import attention, fla, nsgdn  # noqa: E402,F401

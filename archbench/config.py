@@ -7,7 +7,7 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    arch: str = "pgdn"
+    arch: str = "nsgdn"
     d_model: int = 512
     n_layer: int = 8
     vocab_size: Optional[int] = None

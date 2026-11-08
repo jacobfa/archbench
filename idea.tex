@@ -1,0 +1,61 @@
+\section*{An \(N\)-step gated delta rule}
+
+Let \(S_{t-1}\in\mathbb{R}^{d_v\times d_k}\) be the memory,
+\(k_t\) a unit key, \(v_t\) its target value, and \(q_t\) the read query.
+Apply the forget gate once and compute the current prediction error,
+\[
+B_t=\alpha_t S_{t-1},
+\qquad
+r_t=v_t-B_tk_t.
+\]
+
+Taking \(N\) gradient steps of size \(\beta_t\) on the usual loss
+\(\tfrac12\|Sk_t-v_t\|_2^2\) gives
+\[
+S_t=B_t+\bigl[1-(1-\beta_t)^N\bigr]r_tk_t^\top.
+\]
+Thus repeated steps on the same association only rescale the write gate.
+
+\paragraph{Protecting a previous read.}
+Let \(p_t=k_{t-1}\), with \(p_1=0\). To let later steps adjust the
+write direction, penalize changes to the value read at \(p_t\).
+Starting from \(S^{(0)}=B_t\), take \(N\) gradient steps on
+\[
+\mathcal{L}_t(S)
+=
+\frac12\|Sk_t-v_t\|_2^2
++
+\frac{\lambda}{2}\|(S-B_t)p_t\|_2^2.
+\]
+The second term has zero gradient at \(B_t\), so the first step is
+exactly the ordinary gated delta update. Later steps can correct
+interference caused by that write.
+
+\paragraph{Exact vector recurrence.}
+Every inner iterate has the form \(S^{(j)}=B_t+r_tu_j^\top\).
+Thus all \(N\) gradient steps require only one matrix write:
+\[
+\boxed{
+\begin{aligned}
+u_0 &= 0,\\
+u_{j+1}
+&=u_j+\beta_t\Bigl[
+  (1-k_t^\top u_j)k_t
+  -\lambda(p_t^\top u_j)p_t
+\Bigr],
+\qquad j=0,\ldots,N-1,\\
+S_t &= B_t+r_tu_N^\top,\\
+y_t &= S_tq_t.
+\end{aligned}
+}
+\]
+
+For \(N=2\), the effective write direction is
+\[
+u_2
+=(2\beta_t-\beta_t^2)k_t
+-\lambda\beta_t^2(p_t^\top k_t)p_t.
+\]
+The correction vanishes for orthogonal keys. For overlapping,
+nonparallel keys and \(\lambda>0\), it tilts the write away from
+the direction that disturbed the previous read.

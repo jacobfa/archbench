@@ -1,0 +1,7 @@
+_base_: [_size.yaml, ../arch/nsgdn.yaml]
+
+model:
+  d_model: 384
+  n_layer: 10
+  layer:
+    num_heads: 3

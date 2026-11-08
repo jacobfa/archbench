@@ -1,0 +1,14 @@
+model:
+  arch: nsgdn
+  mlp: true
+  layer:
+    head_dim: 128
+    expand_v: 2.0
+    n_steps: 2
+    lam: 1.0
+    use_gate: true
+    use_short_conv: true
+    conv_size: 4
+
+wandb:
+  tags: [nsgdn]
