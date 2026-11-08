@@ -68,7 +68,7 @@ class TrainConfig:
     tokens: Optional[float] = None  # fixed token budget shared by every model of a size (configs/<size>/_size.yaml)
     tokens_per_param: float = 20.0
     batch_size: int = 256
-    grad_accum: int = 2
+    grad_accum: int = 1
     eval_every: int = 250
     eval_steps: int = 32
     core_every: int = 0
