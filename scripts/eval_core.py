@@ -33,7 +33,7 @@ def main():
     print(f"{run_dir}/{tag}  step {state['step']}  arch {cfg.model.arch}  params {model.num_params():,}")
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.autocast("cpu", enabled=False)
     with autocast:
-        metric, _, _ = evaluate_core(lambda x: model(x)[0], tok, device, cfg.train.core_dir, max_per_task, cfg.data.seq_len, verbose=True)
+        metric, _, _ = evaluate_core(lambda x: model(x)[0], tok, device, cfg.train.core_dir, max_per_task, cfg.data.seq_len, log=print)
     print(f"{'CORE':35s} {metric:.4f}")
 
 
