@@ -8,6 +8,11 @@ from .config import ModelConfig
 from .layers import build_mixer
 from .layers.fla import FLAMixer
 
+try:  # fused lm_head + cross-entropy: never materialises the (B*T, vocab) logits
+    from fla.modules import FusedLinearCrossEntropyLoss
+except ImportError:  # pragma: no cover
+    FusedLinearCrossEntropyLoss = None
+
 
 class MLP(nn.Module):
     def __init__(self, d_model: int, ratio: float):
@@ -48,6 +53,7 @@ class LM(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
+        self.fused_ce = FusedLinearCrossEntropyLoss() if FusedLinearCrossEntropyLoss is not None else None
         self._init_weights()
 
     def _init_weights(self):
@@ -82,7 +88,12 @@ class LM(nn.Module):
         x = self.embed(idx)
         for block in self.blocks:
             x = block(x)
-        logits = self.lm_head(self.norm(x))
+        x = self.norm(x)
+        if targets is not None and self.fused_ce is not None and x.is_cuda:
+            # training/eval only need the loss; the fused kernel chunks over tokens and skips the logits tensor
+            dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+            return None, self.fused_ce(x.to(dt), targets, self.lm_head.weight.to(dt))
+        logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.float().flatten(0, 1), targets.flatten())
