@@ -3,6 +3,7 @@ model:
   mlp: true
   layer:
     rope_base: 10000.0
+    qk_norm: true
 
 train:
   compile: true

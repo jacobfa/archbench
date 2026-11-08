@@ -12,11 +12,11 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int = 8, rope_base: float = 10000.0, layer_idx: int | None = None):
+    def __init__(self, d_model: int, num_heads: int = 8, rope_base: float = 10000.0, qk_norm: bool = False, layer_idx: int | None = None):
         super().__init__()
         if d_model % num_heads:
             raise ValueError("d_model must be divisible by num_heads")
-        self.H, self.hd, self.base = num_heads, d_model // num_heads, rope_base
+        self.H, self.hd, self.base, self.qk_norm = num_heads, d_model // num_heads, rope_base, qk_norm
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         self._cache: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -34,6 +34,8 @@ class Attention(nn.Module):
         q, k, v = self.qkv(x).view(B, T, 3, self.H, self.hd).unbind(2)
         cos, sin = self._freqs(T, x.device)
         q, k = _rope(q, cos, sin), _rope(k, cos, sin)
+        if self.qk_norm:
+            q, k = 1.2 * F.rms_norm(q, (self.hd,)), 1.2 * F.rms_norm(k, (self.hd,))
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         return self.o_proj(y.transpose(1, 2).reshape(B, T, D))
 

@@ -23,6 +23,30 @@ def fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+# dense bf16 peak FLOP/s, most specific pattern first
+PEAK_FLOPS = (
+    (("gb200",), 2.5e15),
+    (("b200",), 2.25e15),
+    (("h200",), 989e12),
+    (("h100", "nvl"), 835e12),
+    (("h100", "pcie"), 756e12),
+    (("h100",), 989e12),
+    (("a100",), 312e12),
+    (("l40s",), 362e12),
+    (("a40",), 149.7e12),
+    (("l4",), 121e12),
+    (("mi300x",), 1.3074e15),
+    (("5090",), 209.5e12),
+    (("4090",), 165.2e12),
+    (("3090",), 71e12),
+)
+
+
+def peak_flops(device_name: str) -> float:
+    name = device_name.lower()
+    return next((f for pats, f in PEAK_FLOPS if all(p in name for p in pats)), 0.0)
+
+
 def fmt_count(n: float) -> str:
     for unit, div in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
         if n >= div:
@@ -58,9 +82,9 @@ class PhaseTimer:
 
 
 class Meter:
-    def __init__(self, total_steps: int, eval_every: int, ckpt_every: int, momentum: float = 0.9):
-        self.total, self.eval_every, self.ckpt_every, self.m = total_steps, eval_every, ckpt_every, momentum
-        self.step_time = self.eval_time = self.ckpt_time = None
+    def __init__(self, total_steps: int, every: dict[str, int], momentum: float = 0.9):
+        self.total, self.every, self.m = total_steps, every, momentum
+        self.step_time, self.event_time = None, {}
         self.steady_time, self.steady_steps = 0.0, 0
         self.start = time.perf_counter()
 
@@ -72,11 +96,8 @@ class Meter:
         self.steady_steps += n_steps
         self.step_time = self._ema(self.step_time, wall / n_steps)
 
-    def update_eval(self, seconds: float):
-        self.eval_time = self._ema(self.eval_time, seconds)
-
-    def update_ckpt(self, seconds: float):
-        self.ckpt_time = self._ema(self.ckpt_time, seconds)
+    def update_event(self, name: str, seconds: float):
+        self.event_time[name] = self._ema(self.event_time.get(name), seconds)
 
     def _remaining_events(self, step: int, every: int) -> int:
         if every <= 0:
@@ -90,11 +111,7 @@ class Meter:
         avg = self.steady_time / max(1, self.steady_steps)
         per_step = 0.5 * (self.step_time + avg)
         remaining = self.total - step
-        return (
-            remaining * per_step
-            + self._remaining_events(step, self.eval_every) * (self.eval_time or 0.0)
-            + self._remaining_events(step, self.ckpt_every) * (self.ckpt_time or 0.0)
-        )
+        return remaining * per_step + sum(self._remaining_events(step, every) * self.event_time.get(name, 0.0) for name, every in self.every.items())
 
     def finish_at(self, step: int) -> str:
         eta = self.eta(step)
@@ -133,7 +150,7 @@ class Logger:
             )
             self.wandb_id = self.run.id
             self.run.define_metric("tokens")
-            for prefix in ("train/*", "val/*", "perf/*"):
+            for prefix in ("train/*", "val/*", "core/*", "perf/*"):
                 self.run.define_metric(prefix, step_metric="step")
 
     def log(self, metrics: dict, step: int):

@@ -19,6 +19,11 @@ class TokenData:
     def vocab_size(self) -> int:
         return self.meta["vocab_size"]
 
+    def tokenizer(self):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(self.meta["tokenizer"])
+
     def num_tokens(self, split: str) -> int:
         return len(self.splits[split])
 
@@ -30,3 +35,9 @@ class TokenData:
             buf = buf.pin_memory()
         buf = buf.to(device, non_blocking=True)
         return buf[:, :-1], buf[:, 1:]
+
+
+def token_bytes(tok) -> torch.Tensor:
+    special = set(tok.all_special_ids)
+    text = tok.batch_decode([[i] for i in range(len(tok))], clean_up_tokenization_spaces=False)
+    return torch.tensor([0 if i in special else len(s.encode()) for i, s in enumerate(text)])

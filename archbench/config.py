@@ -13,8 +13,15 @@ class ModelConfig:
     vocab_size: Optional[int] = None
     mlp: bool = True
     mlp_ratio: float = 4.0
+    mlp_act: str = "swiglu"  # swiglu | relu2
     tie_embeddings: bool = True
     norm_eps: float = 1e-5
+    embed_norm: bool = False
+    resid_scalars: bool = False  # learnable per-layer residual and x0 (input embedding) mixing
+    smear: bool = False  # gated mix of the previous token's embedding
+    backout: bool = False  # subtract a scaled mid-depth residual before the final norm
+    zero_init: bool = False  # zero-init every block output projection
+    logit_softcap: float = 0.0  # > 0 disables the fused lm_head + cross-entropy kernel
     layer: dict = field(default_factory=dict)
 
 
@@ -28,6 +35,8 @@ class DataConfig:
 class OptimConfig:
     name: str = "muon_adamw"
     lr: float = 6e-4
+    schedule: str = "cosine"  # cosine | wsd
+    warmdown_ratio: float = 0.65
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -37,8 +46,11 @@ class OptimConfig:
     grad_clip: float = 1.0
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
+    muon_momentum_warmup: int = 0  # steps to ramp momentum from 0.85
+    muon_beta2: float = 0.95
     muon_weight_decay: float = 0.0
     muon_ns_steps: int = 5
+    scalar_lr: float = 0.5
     soap_precondition_frequency: int = 10
     soap_max_precond_dim: int = 8192
 
@@ -59,6 +71,9 @@ class TrainConfig:
     grad_accum: int = 2
     eval_every: int = 250
     eval_steps: int = 32
+    core_every: int = 0
+    core_max_per_task: int = 500
+    core_dir: str = "~/.cache/archbench/eval_bundle"
     log_every: int = 10
     ckpt_every: int = 1000
     log_dir: str = "logs"
@@ -90,6 +105,10 @@ class Config:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Config":
+        return _build(cls, _merge(asdict(cls()), d))
 
 
 def resolve_steps(train: TrainConfig, tokens_per_step: int, n_params: int) -> int:

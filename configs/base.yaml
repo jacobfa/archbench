@@ -3,7 +3,14 @@ model:
   n_layer: 8
   mlp: true
   mlp_ratio: 4.0
+  mlp_act: swiglu
   tie_embeddings: true
+  embed_norm: true
+  resid_scalars: true
+  smear: true
+  backout: true
+  zero_init: true
+  logit_softcap: 0.0
 
 data:
   path: /dev/shm/fftnet/data/fineweb_edu
@@ -12,6 +19,8 @@ data:
 optim:
   name: muon_adamw
   lr: 6.0e-4
+  schedule: wsd
+  warmdown_ratio: 0.65
   min_lr_ratio: 0.1
   weight_decay: 0.1
   beta1: 0.9
@@ -20,7 +29,10 @@ optim:
   grad_clip: 1.0
   muon_lr: 0.02
   muon_momentum: 0.95
+  muon_momentum_warmup: 300
+  muon_beta2: 0.95
   muon_weight_decay: 0.0
+  scalar_lr: 0.5
 
 deepspeed:
   zero_stage: 0
@@ -32,6 +44,9 @@ train:
   grad_accum: 2
   eval_every: 250
   eval_steps: 32
+  core_every: 2000
+  core_max_per_task: 500
+  core_dir: ~/.cache/archbench/eval_bundle
   log_every: 10
   ckpt_every: 1000
   log_dir: logs
