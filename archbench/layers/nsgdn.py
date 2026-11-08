@@ -1,7 +1,9 @@
-"""N-step gated delta rule (idea.tex).
+"""N-step gated delta rule (new.tex).
 
-Per head: B = alpha S, r = v - B k, S = B + r u^T, y = S q, where the write direction u is N gradient steps on
-1/2 (1 - k.u)^2 + lam/2 (p.u)^2 with p = k_{t-1}; u = beta k for N = 1 (plain GDN).  u is computed in PyTorch.
+Per head: B = alpha S, r = v - B k, S = B + r u^T, y = S q.  The write direction u starts as the ordinary gated
+delta step u_1 = beta k; the remaining N-1 steps descend lam/2 |(S - B) p|^2 with p = k_{t-1}, projected onto
+updates with Delta S k = 0, i.e. u <- u - lam beta (p.u) p_perp, p_perp = p - (p.k) k.  u = beta k for N = 1
+(plain GDN).  u is computed in PyTorch.
 
 The recurrence S = alpha S (I - k u^T) + v u^T is a DPLR transition (diagonal alpha plus rank-1 -alpha u k^T on the
 transposed state), so by default it runs on fla's chunked DPLR kernel (tensor cores, bf16 inputs, fp32 state) with
@@ -57,13 +59,19 @@ def pick_scan(x: torch.Tensor, impl: str = "chunk"):
 
 
 def write_direction(k, p, beta, lam, n_steps: int) -> torch.Tensor:
+    """u_1 = beta k; then N-1 steps u <- u - lam beta (p.u) p_perp with p_perp = p - (p.k) k (new.tex).
+
+    The projection keeps k.u = beta (current-key gain fixed) while each extra step shrinks the disturbance p.u
+    to the previous read by (1 - lam beta |p_perp|^2).
+    """
     b = beta[..., None]
     l = lam[None, None, :, None]
-    u = torch.zeros_like(k)
-    for _ in range(n_steps):
-        ku = (k * u).sum(-1, keepdim=True)
-        pu = (p * u).sum(-1, keepdim=True)
-        u = u + b * ((1.0 - ku) * k - l * pu * p)
+    u = b * k
+    if n_steps > 1:
+        p_perp = p - (p * k).sum(-1, keepdim=True) * k
+        for _ in range(n_steps - 1):
+            pu = (p * u).sum(-1, keepdim=True)
+            u = u - l * b * pu * p_perp
     return u
 
 
