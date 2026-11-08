@@ -1,8 +1,11 @@
 """N-step gated delta rule (idea.tex).
 
 Per head: B = alpha S, r = v - B k, S = B + r u^T, y = S q, where the write direction u is N gradient steps on
-1/2 (1 - k.u)^2 + lam/2 (p.u)^2 with p = k_{t-1}; u = beta k for N = 1 (plain GDN).  u is computed in PyTorch;
-the Triton kernel runs the generalised recurrence S = alpha S (I - k u^T) + v u^T with fp32 state in registers.
+1/2 (1 - k.u)^2 + lam/2 (p.u)^2 with p = k_{t-1}; u = beta k for N = 1 (plain GDN).  u is computed in PyTorch.
+
+The recurrence S = alpha S (I - k u^T) + v u^T is a DPLR transition (diagonal alpha plus rank-1 -alpha u k^T on the
+transposed state), so by default it runs on fla's chunked DPLR kernel (tensor cores, bf16 inputs, fp32 state) with
+k_fla = b = u, a = -alpha k, gk = log alpha
 """
 
 import math
@@ -24,6 +27,11 @@ try:
 except ImportError:  # pragma: no cover
     triton = None
 
+try:
+    from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
+except ImportError:  # pragma: no cover
+    chunk_dplr_delta_rule = None
+
 CHUNK = 32  # tokens between stored states; the backward recomputes inside a chunk
 ROWS = 16  # rows of S per program
 NUM_WARPS = 4
@@ -31,6 +39,14 @@ NUM_WARPS = 4
 
 def nsgdn_available(x: torch.Tensor) -> bool:
     return triton is not None and x.is_cuda
+
+
+def pick_scan(x: torch.Tensor):
+    if x.is_cuda and chunk_dplr_delta_rule is not None:
+        return nsgdn_scan_fla
+    if nsgdn_available(x):
+        return nsgdn_scan
+    return nsgdn_ref
 
 
 def write_direction(k, p, beta, lam, n_steps: int) -> torch.Tensor:
@@ -190,6 +206,21 @@ def nsgdn_scan(q, k, u, v, la) -> torch.Tensor:
     return _nsgdn_fwd(q.contiguous(), k.contiguous(), u.contiguous(), v.contiguous(), la.contiguous())[0]
 
 
+def nsgdn_scan_fla(q, k, u, v, la) -> torch.Tensor:
+    """Same recurrence on fla's chunked DPLR kernel; y (B, T, H, DV) in bf16.
+
+    With S' = S^T (DK x DV) the step is S' = (alpha I - alpha u k^T) S' + u v^T, y = S'^T q, i.e. fla's
+    S' = (diag(exp gk) + b a^T) S' + k_fla v^T with k_fla = b = u, a = -alpha k, gk = la broadcast over DK, scale 1
+    (q is already scaled by DK^-1/2 in the module).
+    """
+    dt = torch.bfloat16
+    a = -(la.exp()[..., None] * k)
+    gk = la[..., None].expand_as(k)
+    u = u.to(dt)
+    y, _ = chunk_dplr_delta_rule(q.to(dt), u, v.to(dt), a.to(dt), u, gk, scale=1.0)
+    return y
+
+
 def nsgdn_ref(q, k, u, v, la) -> torch.Tensor:
     B, T, H, DK = q.shape
     S = q.new_zeros(B, H, v.shape[-1], DK)
@@ -272,8 +303,7 @@ class NStepGDN(nn.Module):
             beta = torch.sigmoid(ab[..., H:] + self.b_bias)
             p = F.pad(k[:, :-1], (0, 0, 0, 0, 1, 0))
             u = write_direction(k, p, beta, F.softplus(self.lam.float()), self.n_steps)
-            scan = nsgdn_scan if nsgdn_available(x) else nsgdn_ref
-            y = scan(q, k, u, v, la)
+            y = pick_scan(x)(q, k, u, v, la)
         y = self.norm(y.to(x.dtype))
         if self.use_gate:
             y = y * F.silu(g).view(B, T, H, DV)
