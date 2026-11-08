@@ -228,7 +228,9 @@ class Trainer:
         self.engine.eval()
         t0 = time.perf_counter()
         with self.autocast:
-            metric, _, centered = evaluate_core(self.logits, self.tok, self.device, t.core_dir, t.core_max_per_task, self.cfg.data.seq_len)
+            metric, _, centered = evaluate_core(
+                self.logits, self.tok, self.device, t.core_dir, t.core_max_per_task, self.cfg.data.seq_len, log=self.log.print
+            )
             samples = sample(self.logits, self.tok, self.device) if self.main else []
         self.engine.train()
         took = time.perf_counter() - t0
