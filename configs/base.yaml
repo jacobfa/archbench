@@ -41,7 +41,7 @@ train:
   steps: null
   tokens_per_param: 20
   batch_size: 256
-  grad_accum: 2
+  grad_accum: 1
   eval_every: 250
   eval_steps: 32
   core_every: 2000
